@@ -1,0 +1,348 @@
+---
+title: "Protein Subcellular Location Classification"
+output: html_notebook
+---
+
+# Reading in Data Section
+Using all swiss prot entries, filter by homo sapiens. And select the following features: mass, length, sequence, and subcellular location
+
+```{r}
+# Install required packages
+if (!require("readr")) install.packages("readr")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("Peptides")) install.packages("Peptides")
+if (!require("protr")) install.packages("protr")
+if (!require("caret")) install.packages("caret")
+if (!require("randomForest")) install.packages("randomForest")
+if (!require("e1071")) install.packages("e1071")
+if (!require("ggplot2")) install.packages("ggplot2")
+```
+
+```{r}
+library(readr)
+
+# Update this path to your actual file location
+file_path <- "C:\\Users\\ollfo\\OneDrive\\Desktop\\Projects\\uniprotkb_reviewed_true_AND_model_organ_2025_01_17.tsv"
+# Try with base R function instead of readr
+uniprot_data <- read.delim(gzfile(file_path), sep = "\t", header = TRUE)
+
+print(head(uniprot_data))
+```
+
+```{r}
+# Check unique values
+unique(uniprot_data$`Subcellular.location..CC.`)
+```
+
+```{r}
+# Get frequency count of each location
+location_counts <- table(uniprot_data$`Subcellular.location..CC.`)
+location_counts <- sort(location_counts, decreasing = TRUE)
+
+# View counts and percentage of total
+location_summary <- data.frame(
+  Count = as.numeric(location_counts),
+  Percentage = round(100 * as.numeric(location_counts)/sum(location_counts), 2)
+)
+rownames(location_summary) <- names(location_counts)
+
+print(location_summary)
+```
+
+```{r}
+# View the names of the columns
+colnames(uniprot_data)
+
+# see the structure of the data
+str(uniprot_data)
+
+# Check for missing values
+sum(is.na(uniprot_data))
+```
+
+# Data Cleaning Section
+Purpose: Filter data and clean subcellular location data to prepare for classification. 
+Steps:
+1. Clean subcellular location data by removing text surrounding the subcellular location such as the code, isoforms.
+2. Removing any samples with n/a values, duplicates.
+3. Write cleaned data to a tsv file.
+
+```{r}
+library(dplyr)
+
+# Clean subcellular location data
+uniprot_data$`Subcellular.location..CC.` <- sub("^SUBCELLULAR LOCATION: (?:\\[.*?\\]: )?([^{.;]+).*$", "\\1", uniprot_data$`Subcellular.location..CC.`)
+
+# Get only the first location (before comma)
+uniprot_data$`Subcellular.location..CC.` <- sub("^([^,]+).*$", "\\1", uniprot_data$`Subcellular.location..CC.`)
+
+# Remove entries that only contain "Note="
+uniprot_data <- uniprot_data[!grepl("^\\s*Note=", uniprot_data$`Subcellular.location..CC.`), ]
+
+# Remove NA values
+uniprot_data <- uniprot_data[!is.na(uniprot_data$`Subcellular.location..CC.`),]
+
+# Trim whitespace after the location text
+uniprot_data$`Subcellular.location..CC.` <- trimws(uniprot_data$`Subcellular.location..CC.`)
+```
+
+```{r}
+# Check unique values to see what locations remain
+unique(uniprot_data$`Subcellular.location..CC.`)
+```
+
+```{r}
+# Get frequency of each location
+location_counts <- table(uniprot_data$`Subcellular.location..CC.`)
+location_counts <- sort(location_counts, decreasing = TRUE)
+
+# View percentage of total
+location_summary <- data.frame(
+  Count = as.numeric(location_counts),
+  Percentage = round(100 * as.numeric(location_counts)/sum(location_counts), 2)
+)
+rownames(location_summary) <- names(location_counts)
+
+print(location_summary)
+```
+
+```{r}
+# Count missing values in each column
+colSums(is.na(uniprot_data))
+
+# Check for rows with missing values
+missing_data <- uniprot_data[!complete.cases(uniprot_data), ]
+print(nrow(missing_data))
+```
+
+```{r}
+# Check for duplicates
+duplicates <- uniprot_data[duplicated(uniprot_data), ]
+print(nrow(duplicates))
+
+# Remove duplicate rows
+uniprot_data <- uniprot_data[!duplicated(uniprot_data), ]
+```
+
+```{r}
+# Remove rows with missing critical values
+uniprot_data <- uniprot_data %>%
+  filter(!is.na(Sequence), !is.na(Length), !is.na(Mass))
+
+# Convert all sequences to uppercase
+uniprot_data <- uniprot_data %>%
+  mutate(sequence = toupper(Sequence))
+
+# Check that only valid amino acid codes are used
+valid_amino_acids <- "^[ACDEFGHIKLMNPQRSTVWY]+$"
+uniprot_data <- uniprot_data %>%
+  filter(grepl(valid_amino_acids, sequence))
+```
+
+```{r}
+# Save cleaned data as TSV file
+write_tsv(uniprot_data, "cleaned_uniprot_data.tsv")
+```
+
+```{r}
+# Filter to keep only locations with >= 100 instances
+location_counts <- table(uniprot_data$`Subcellular.location..CC.`)
+frequent_locations <- names(location_counts[location_counts >= 100])
+frequent_loc_counts <- sort(location_counts[frequent_locations], decreasing = TRUE)
+print(frequent_loc_counts)
+
+# Filter the dataframe to keep only rows with these frequent locations
+uniprot_data_frequent <- uniprot_data[uniprot_data$`Subcellular.location..CC.` %in% frequent_locations, ]
+
+print(paste("Number of unique locations kept:", length(frequent_locations)))
+print(paste("Number of rows in filtered dataset:", nrow(uniprot_data_frequent)))
+```
+
+# Feature Extraction Section
+Purpose: extract amino acid composition and hydrophobicity of each sequence to use as features to train my model.
+Steps:
+- Use the Peptides package to compute hydrophobicity, using the KyteDoolittle scale.
+- Use the protr package to compute the percentage of each amino acid in each sequence.
+
+```{r}
+library(Peptides)
+
+# Initialize empty vector to store hydrophobicity values
+hydrophobicity_values <- numeric(nrow(uniprot_data_frequent))
+
+# Iterate through each protein sequence in the frequent subset
+for (i in 1:nrow(uniprot_data_frequent)) {
+  # Get the sequence
+  sequence <- uniprot_data_frequent$Sequence[i]
+  
+  # compute hydrophobicity using Kyte-Doolittle scale
+  hydrophobicity_values[i] <- hydrophobicity(sequence, scale = "KyteDoolittle")
+}
+
+# Add hydrophobicity to the dataframe
+uniprot_data_frequent$Hydrophobicity <- hydrophobicity_values
+
+# View the updated dataframe with the new hydrophobicity feature
+head(uniprot_data_frequent)
+```
+
+```{r}
+library(protr)
+
+aa_list <- c("A", "R", "N", "D", "C", "Q", "E", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+
+# Initialize matrix for amino acid compositions
+aa_compositions <- matrix(0, nrow = nrow(uniprot_data_frequent), ncol = 20)
+colnames(aa_compositions) <- paste0("AA_", aa_list)
+
+# Calculate composition for each sequence
+for (i in 1:nrow(uniprot_data_frequent)) {
+    sequence <- uniprot_data_frequent$Sequence[i]
+    
+    # Calculate amino acid composition using protr
+    composition <- extractAAC(sequence)
+    
+    # Store the composition values
+    aa_compositions[i,] <- composition
+}
+
+# Add to dataframe
+aa_comp_df <- as.data.frame(aa_compositions)
+uniprot_data_frequent <- cbind(uniprot_data_frequent, aa_comp_df)
+```
+
+```{r}
+# Check the sum of amino acid compositions for the first few sequences
+rowSums(uniprot_data_frequent[, grep("^AA_", colnames(uniprot_data_frequent))])
+```
+
+# Model Training Section - Simple Random Forest
+Purpose: Train Random Forest classifier for predicting protein subcellular location
+Features used:
+- Mass: Protein molecular weight
+- Length: Sequence length
+- Hydrophobicity: KyteDoolittle scale
+- AA_*: Amino acid composition percentages
+
+```{r}
+library(caret)
+library(randomForest)
+
+# Create proper train/test split
+set.seed(123)
+train_indices <- createDataPartition(
+  uniprot_data_frequent$`Subcellular.location..CC.`, 
+  p = 0.8,
+  list = FALSE
+)
+
+train_data <- uniprot_data_frequent[train_indices, ]
+features_train <- train_data[, c("Mass", "Length", "Hydrophobicity", grep("^AA_", colnames(train_data), value = TRUE))]
+target_train <- as.factor(train_data$`Subcellular.location..CC.`)
+
+test_data <- uniprot_data_frequent[-train_indices, ]
+features_test <- test_data[, c("Mass", "Length", "Hydrophobicity", grep("^AA_", colnames(test_data), value = TRUE))]
+target_test <- as.factor(test_data$`Subcellular.location..CC.`)
+
+# Clean factor levels to be valid R variable names
+levels(target_train) <- make.names(levels(target_train))
+levels(target_test) <- make.names(levels(target_test))
+
+# Simple Random Forest - no cross-validation, basic parameters
+rf_model_simple <- randomForest(
+  x = features_train,
+  y = target_train,
+  ntree = 500,        # Moderate number of trees
+  mtry = 5,           # Fixed parameter
+  importance = TRUE
+)
+
+# Test performance
+rf_predictions <- predict(rf_model_simple, features_test)
+rf_cm <- confusionMatrix(rf_predictions, target_test)
+
+print("Simple Random Forest Performance:")
+print(rf_cm)
+print(paste("Training time was fast, accuracy:", round(rf_cm$overall["Accuracy"], 3)))
+```
+
+# Enhanced Model with Dipeptide Features
+Purpose: Add dipeptide composition features to improve accuracy
+
+```{r}
+# Extract dipeptide composition for training data
+print("Extracting dipeptide features for training data...")
+dipeptide_train <- matrix(0, nrow = nrow(train_data), ncol = 400)
+for (i in 1:nrow(train_data)) {
+  sequence <- train_data$Sequence[i]
+  dipeptide_train[i,] <- extractDC(sequence)
+}
+colnames(dipeptide_train) <- paste0("DC_", 1:400)
+
+# Extract dipeptide composition for test data
+print("Extracting dipeptide features for test data...")
+dipeptide_test <- matrix(0, nrow = nrow(test_data), ncol = 400)
+for (i in 1:nrow(test_data)) {
+  sequence <- test_data$Sequence[i]
+  dipeptide_test[i,] <- extractDC(sequence)
+}
+colnames(dipeptide_test) <- paste0("DC_", 1:400)
+
+# Combine original features with dipeptide features
+features_train_enhanced <- cbind(features_train, dipeptide_train)
+features_test_enhanced <- cbind(features_test, dipeptide_test)
+
+# Train Random Forest with enhanced features
+rf_model_enhanced <- randomForest(
+  x = features_train_enhanced,
+  y = target_train,
+  ntree = 500,
+  mtry = 20,  # Increased from 5 due to more features
+  importance = TRUE
+)
+
+# Test performance
+rf_predictions_enhanced <- predict(rf_model_enhanced, features_test_enhanced)
+rf_cm_enhanced <- confusionMatrix(rf_predictions_enhanced, target_test)
+
+print("Enhanced Random Forest Performance:")
+print(rf_cm_enhanced)
+print(paste("Accuracy with dipeptide features:", round(rf_cm_enhanced$overall["Accuracy"], 3)))
+```
+
+# Results Comparison
+```{r}
+# Compare simple vs enhanced model
+simple_accuracy <- rf_cm$overall["Accuracy"]vj
+enhanced_accuracy <- rf_cm_enhanced$overall["Accuracy"]
+
+print(paste("Simple model accuracy:", round(simple_accuracy, 3)))
+print(paste("Enhanced model accuracy:", round(enhanced_accuracy, 3)))
+print(paste("Improvement:", round(enhanced_accuracy - simple_accuracy, 3)))
+```
+
+# Feature Importance Analysis
+```{r}
+# Look at feature importance for enhanced model
+importance_scores <- importance(rf_model_enhanced)
+importance_df <- data.frame(
+  Feature = rownames(importance_scores),
+  Importance = importance_scores[,1]
+)
+importance_df <- importance_df[order(importance_df$Importance, decreasing = TRUE), ]
+
+# Show top 20 most important features
+print("Top 20 Most Important Features:")
+print(head(importance_df, 20))
+```
+
+# Save Results
+```{r}
+# Save the enhanced model
+save(rf_model_enhanced, file = "enhanced_rf_model.RData")
+
+# Save feature importance
+write.csv(importance_df, "feature_importance.csv", row.names = FALSE)
+
+print("Analysis complete! Model and results saved.")
+```
